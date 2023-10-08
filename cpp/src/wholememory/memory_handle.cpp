@@ -457,8 +457,8 @@ class global_mapped_host_wholememory_impl : public wholememory_impl {
 #endif
     if (comm_->world_rank == 0) {
 #ifdef USE_SYSTEMV_SHM
-      // shm_id = shmget(shm_key, alloc_strategy_.local_alloc_size, 0644 | IPC_CREAT | IPC_EXCL);
-      shm_id = shmget(shm_key, alloc_strategy_.local_alloc_size, 0644 | IPC_CREAT | IPC_EXCL | SHM_HUGETLB | SHM_HUGE_512MB);
+      shm_id = shmget(shm_key, alloc_strategy_.local_alloc_size, 0644 | IPC_CREAT | IPC_EXCL);
+      // shm_id = shmget(shm_key, alloc_strategy_.local_alloc_size, 0644 | IPC_CREAT | IPC_EXCL | SHM_HUGETLB | SHM_HUGE_512MB);
       // shm_id = shmget(shm_key, alloc_strategy_.local_alloc_size, 0644 | IPC_CREAT | IPC_EXCL | SHM_HUGETLB | SHM_HUGE_16GB);
       if (shm_id == -1) {
         WHOLEMEMORY_FATAL(

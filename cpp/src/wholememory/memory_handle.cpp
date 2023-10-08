@@ -562,6 +562,219 @@ class global_mapped_host_wholememory_impl : public wholememory_impl {
   } shared_host_handle_;
 };
 
+// Implementation for continuous host wholememory that use cuda driver api.
+// Each rank allocate multiple pages and share pages with other ranks.
+// for CONTINUOUS type with HOST location
+#if (__CUDA_VER_MAJOR__ >= 12 && __CUDA_VER_MINOR__ >=3)
+class continuous_host_wholememory_cuda_driver_impl : public wholememory_impl {
+ public:
+  continuous_host_wholememory_cuda_driver_impl(wholememory_handle_t wholememory_handle,
+                                     size_t total_size,
+                                     wholememory_comm_t comm,
+                                     wholememory_memory_type_t memory_type,
+                                     wholememory_memory_location_t memory_location,
+                                     size_t data_granularity)
+    : wholememory_impl(
+        wholememory_handle, total_size, comm, memory_type, memory_location, data_granularity)
+  {
+    WHOLEMEMORY_CHECK(type_ == WHOLEMEMORY_MT_CONTINUOUS);
+    WHOLEMEMORY_CHECK(location_ == WHOLEMEMORY_ML_HOST);
+  }
+  void create_memory() override
+  {
+    each_rank_multiple_page_strategy();
+    generate_rank_partition_strategy();
+    create_and_map_driver_host_memory();
+    register_continuous_host_memory();
+  }
+  void destroy_memory() noexcept override
+  {
+    unregister_continuous_device_memory();
+    unmap_and_destroy_driver_host_memory();
+  }
+  [[nodiscard]] void* get_continuous_mapping_pointer() const noexcept override
+  {
+    return cu_alloc_handle_.mapped_whole_memory;
+  }
+  [[nodiscard]] wholememory_gref_t get_global_reference() const noexcept override
+  {
+    wholememory_gref_t gref{};
+    gref.pointer = get_continuous_mapping_pointer();
+    gref.stride  = 0;
+    return gref;
+  }
+  bool contains_pointer(const void* ptr) const override
+  {
+    uint64_t int_ptr       = reinterpret_cast<uint64_t>(ptr);
+    uint64_t int_start_ptr = reinterpret_cast<uint64_t>(cu_alloc_handle_.mapped_whole_memory);
+    return int_ptr >= int_start_ptr && int_ptr < int_start_ptr + total_size_;
+  }
+  bool get_rank_memory(void** rank_memory_ptr,
+                       size_t* rank_memory_size,
+                       size_t* rank_memory_offset,
+                       int rank) const noexcept override
+  {
+    size_t mem_size, mem_start;
+    get_rank_partition_info(&mem_size, &mem_start, rank);
+    if (rank_memory_ptr != nullptr)
+      *rank_memory_ptr = (char*)get_continuous_mapping_pointer() + mem_start;
+    if (rank_memory_size != nullptr) *rank_memory_size = mem_size;
+    if (rank_memory_offset != nullptr) *rank_memory_offset = mem_start;
+    return true;
+  }
+
+ protected:
+  void register_continuous_device_memory()
+  {
+    std::unique_lock<std::mutex> vma_lock(wholememory_vma_mu);
+    register_wholememory_vma_range_locked(
+      cu_alloc_handle_.mapped_whole_memory, total_size_, handle_);
+  }
+  void unregister_continuous_device_memory() noexcept
+  {
+    std::unique_lock<std::mutex> vma_lock(wholememory_vma_mu);
+    unregister_wholememory_vma_range_locked(
+      cu_alloc_handle_.mapped_whole_memory, total_size_, handle_);
+  }
+
+  static CUmemGenericAllocationHandle create_cu_mem(size_t mem_size, int dev_id)
+  {
+    CUmemGenericAllocationHandle h;
+    CUmemAllocationProp prop;
+    memset(&prop, 0, sizeof(prop));
+    int numa_id;
+    cuDeviceGetAttribute(&numa_id, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, device_id);
+
+    prop.type                       = CU_MEM_ALLOCATION_TYPE_PINNED;
+    //prop.requestedHandleTypes       = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    prop.location.type              = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    prop.location.id = numa_id;
+    prop.allocFlags.compressionType = CU_MEM_ALLOCATION_COMP_NONE;
+    WM_CU_CHECK(cuMemCreate(&h, mem_size, &prop, 0));
+    return h;
+  }
+
+  static CUmemFabricHandle create_sharable_fabric_handle(CUmemGenericAllocationHandle h)
+  {
+    CUmemFabricHandle fabric_handle;
+    if (h != 0) {
+      WM_CU_CHECK(cuMemExportToShareableHandle(
+        &fabric_handle, h, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+    }
+    return fabric_handle;
+  }
+
+  void exchange_driver_host_memory_handles(
+    std::vector<CUmemFabricHandle>* recv_ipc_sharable_cu_fabric_handles,
+    CUmemFabricHandle* send_ipc_sharable_cu_fabric_handle)
+  {
+    communicator_barrier(comm_);
+    recv_ipc_sharable_cu_handles->resize(comm_->world_size);
+    comm_->host_allgather(std::reinterpret_cast<const void*>(send_ipc_sharable_cu_fabric_handle), static_cast<void*>(recv_ipc_sharable_cu_fabric_handles->data()), sizeof(CUmemFabricHandle), WHOLEMEMORY_DT_INT8)
+    communicator_barrier(comm_);
+  }
+  static CUmemGenericAllocationHandle import_cu_mem_handle(
+    CUmemFabricHandle  sharable_cu_fabric_handle) 
+  {
+    CUmemGenericAllocationHandle h;
+    WM_CU_CHECK(cuMemImportFromShareableHandle(
+      &h, &sharable_cu_fabric_handle, CU_MEM_HANDLE_TYPE_FABRIC));
+    return h;
+  }
+  void map_driver_host_memory_handles(
+    std::vector<CUmemFabricHandle>* recv_ipc_sharable_cu_fabric_handles)
+  {
+    cu_alloc_handle_.all_cu_handles.resize(comm_->world_size);
+    for (int i = 0; i < comm_->world_size; i++) {
+      size_t mem_size = alloc_strategy_.alloc_sizes[i];
+      if (mem_size > 0) {
+        cu_alloc_handle_.all_cu_handles[i] =
+          import_cu_mem_handle((*recv_ipc_sharable_cu_fabric_handles)[i]);
+
+        WM_CU_CHECK(cuMemMap(reinterpret_cast<CUdeviceptr>(cu_alloc_handle_.mapped_whole_memory) +
+                               alloc_strategy_.alloc_offsets[i],
+                             mem_size,
+                             0,
+                             cu_alloc_handle_.all_cu_handles[i],
+                             0));
+        
+      } 
+      recv_ipc_sharable_cu_fabric_handles->clear();
+    }
+    CUmemAccessDesc madesc;
+    madesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    madesc.location.id   = comm_->dev_id;
+    madesc.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    WM_CU_CHECK(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(cu_alloc_handle_.mapped_whole_memory),
+                               alloc_strategy_.total_alloc_size,
+                               &madesc,
+                               1));
+  }
+  void create_and_map_driver_host_memory()
+  {
+    WM_CU_CHECK(
+      cuMemAddressReserve(reinterpret_cast<CUdeviceptr*>(&cu_alloc_handle_.mapped_whole_memory),
+                          alloc_strategy_.total_alloc_size,
+                          alloc_strategy_.alignment,
+                          0,
+                          0));
+    cu_alloc_handle_.all_cu_handles.resize(comm_->world_size, 0);
+    std::vector<CUmemFabricHandle> recv_ipc_sharable_cu_fabric_handles;
+    cu_alloc_handle_.local_cu_handle = 0;
+    if (alloc_strategy_.local_alloc_size > 0) {
+      cu_alloc_handle_.local_cu_handle =
+        create_cu_mem(alloc_strategy_.local_alloc_size, comm_->dev_id);
+    }
+    cu_alloc_handle_.local_ipc_fabric_handle = create_sharable_fabric_handle(cu_alloc_handle_.local_cu_handle);
+
+    exchange_driver_host_memory_handles(&recv_ipc_sharable_cu_fabric_handles,
+                                          &cu_alloc_handle_.local_ipc_fabric_handle);
+
+    map_driver_host_memory_handles(&recv_ipc_sharable_cu_fabric_handles);
+    local_partition_memory_pointer_ = static_cast<char*>(cu_alloc_handle_.mapped_whole_memory) +
+                                      rank_partition_strategy_.local_mem_offset;
+  }
+  void unmap_and_destroy_driver_host_memory() noexcept
+  {
+    try {
+      communicator_barrier(comm_);
+      for (int i = 0; i < comm_->world_size; i++) {
+        size_t mem_size = alloc_strategy_.alloc_sizes[i];
+        if (mem_size > 0) {
+          WM_CU_CHECK(
+            cuMemUnmap(reinterpret_cast<CUdeviceptr>(cu_alloc_handle_.mapped_whole_memory) +
+                         alloc_strategy_.alloc_offsets[i],
+                       mem_size));
+          WM_CU_CHECK(cuMemRelease(cu_alloc_handle_.all_cu_handles[i]));
+        }
+      }
+      communicator_barrier(comm_);
+      if (alloc_strategy_.local_alloc_size > 0) {
+        WM_CU_CHECK(cuMemRelease(cu_alloc_handle_.local_cu_handle));
+      }
+      WM_CU_CHECK(
+        cuMemAddressFree(reinterpret_cast<CUdeviceptr>(cu_alloc_handle_.mapped_whole_memory),
+                         alloc_strategy_.total_alloc_size));
+
+      communicator_barrier(comm_);
+    } catch (const wholememory::cu_error& wce) {
+      WHOLEMEMORY_FAIL_NOTHROW("%s", wce.what());
+    } catch (const raft::exception& re) {
+      WHOLEMEMORY_FAIL_NOTHROW("%s", re.what());
+    }
+  }
+
+  struct cu_alloc_handle {
+    CUmemGenericAllocationHandle local_cu_handle = 0;
+    std::vector<CUmemGenericAllocationHandle> all_cu_handles;
+    void* mapped_whole_memory = nullptr;
+    CUmemFabricHandle local_ipc_fabric_handle;
+  } cu_alloc_handle_;
+};
+#endif
+
+
 // Implementation for continuous device wholememory that need global map.
 // Each rank allocate multiple pages and share pages with other ranks.
 // for CONTINUOUS type with DEVICE location
